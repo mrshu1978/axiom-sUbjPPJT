@@ -1,0 +1,180 @@
+name: Axiom Build Verification - .NET
+
+on:
+  workflow_dispatch:
+    inputs:
+      workItemId:
+        description: 'WorkItem GUID'
+        required: true
+        type: string
+      orchestrationId:
+        description: 'Orchestration Instance ID'
+        required: true
+        type: string
+      commitSha:
+        description: 'Commit SHA to build'
+        required: true
+        type: string
+
+env:
+  DOTNET_VERSION: '8.0.x'
+
+jobs:
+  build-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commitSha }}
+
+      - name: Mark build start
+        run: echo "AXIOM_BUILD_STARTED_AT=$(date +%s)" >> $GITHUB_ENV
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        id: build
+        run: |
+          dotnet build --no-restore --configuration Release 2>&1 | tee build.log
+          echo "BUILD_EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_ENV
+
+      - name: Run tests (if present)
+        if: always()
+        id: test
+        run: |
+          if [ -d "tests" ]; then
+            dotnet test --no-build --configuration Release --logger "console;verbosity=detailed" 2>&1 | tee test.log
+            echo "TEST_EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_ENV
+          else
+            echo "No tests directory found, skipping tests"
+            echo "TEST_EXIT_CODE=0" >> $GITHUB_ENV
+          fi
+
+      - name: Parse build errors
+        if: always()
+        id: parse-errors
+        run: |
+          python3 << 'EOF'
+          import json
+          import re
+          import os
+
+          errors = []
+          warnings = []
+
+          # Parse build.log
+          if os.path.exists('build.log'):
+              with open('build.log', 'r') as f:
+                  for line in f:
+                      # Pattern: /path/file.cs(line,col): error CS1234: message
+                      error_match = re.match(r'(.+?)\((\d+),(\d+)\): error ([A-Z0-9]+): (.+)', line)
+                      if error_match:
+                          errors.append({
+                              'FilePath': error_match.group(1),
+                              'LineNumber': int(error_match.group(2)),
+                              'ColumnNumber': int(error_match.group(3)),
+                              'ErrorCode': error_match.group(4),
+                              'Message': error_match.group(5).strip(),
+                              'Severity': 'Error'
+                          })
+
+                      # Pattern: /path/file.cs(line,col): warning CS1234: message
+                      warning_match = re.match(r'(.+?)\((\d+),(\d+)\): warning ([A-Z0-9]+): (.+)', line)
+                      if warning_match:
+                          warnings.append({
+                              'FilePath': warning_match.group(1),
+                              'LineNumber': int(warning_match.group(2)),
+                              'Message': warning_match.group(5).strip()
+                          })
+
+          # Parse test.log
+          if os.path.exists('test.log'):
+              with open('test.log', 'r') as f:
+                  for line in f:
+                      if 'Failed!' in line or 'Error Message:' in line:
+                          errors.append({
+                              'FilePath': 'tests',
+                              'LineNumber': 0,
+                              'ColumnNumber': 0,
+                              'ErrorCode': 'TEST_FAILURE',
+                              'Message': line.strip(),
+                              'Severity': 'Error'
+                          })
+
+          with open('errors.json', 'w') as f:
+              json.dump(errors, f, indent=2)
+
+          with open('warnings.json', 'w') as f:
+              json.dump(warnings, f, indent=2)
+
+          print(f"Parsed {len(errors)} errors and {len(warnings)} warnings")
+          EOF
+
+      - name: Send webhook to Axiom
+        if: always()
+        run: |
+          BUILD_SUCCESS="true"
+          if [ "${{ env.BUILD_EXIT_CODE }}" != "0" ] || [ "${{ env.TEST_EXIT_CODE }}" != "0" ]; then
+            BUILD_SUCCESS="false"
+          fi
+
+          ERRORS=$(cat errors.json 2>/dev/null || echo "[]")
+          WARNINGS=$(cat warnings.json 2>/dev/null || echo "[]")
+          START="${AXIOM_BUILD_STARTED_AT:-$(date +%s)}"
+          END="$(date +%s)"
+          ELAPSED=$((END - START))
+          BUILD_DURATION=$(printf "%02d:%02d:%02d" "$((ELAPSED / 3600))" "$(((ELAPSED % 3600) / 60))" "$((ELAPSED % 60))")
+
+          PAYLOAD=$(jq -n \
+            --arg workItemId "${{ github.event.inputs.workItemId }}" \
+            --arg orchestrationId "${{ github.event.inputs.orchestrationId }}" \
+            --arg componentName "${{ github.repository }}" \
+            --arg success "$BUILD_SUCCESS" \
+            --argjson errors "$ERRORS" \
+            --argjson warnings "$WARNINGS" \
+            --arg commitSha "${{ github.event.inputs.commitSha }}" \
+            --arg workflowRunUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg buildDuration "$BUILD_DURATION" \
+            '{
+              WorkItemId: $workItemId,
+              OrchestrationId: $orchestrationId,
+              ComponentName: $componentName,
+              Success: ($success == "true"),
+              Errors: $errors,
+              Warnings: $warnings,
+              CommitSha: $commitSha,
+              WorkflowRunUrl: $workflowRunUrl,
+              BuildDuration: $buildDuration
+            }')
+
+          # Compute HMAC signature
+          SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "${{ secrets.AXIOM_WEBHOOK_SECRET }}" | sed 's/^.* //')
+
+          # Send webhook
+          curl -X POST "${{ secrets.AXIOM_WEBHOOK_URL }}/webhooks/build-complete" \
+            -H "Content-Type: application/json" \
+            -H "X-Axiom-Signature: sha256=$SIGNATURE" \
+            -d "$PAYLOAD" \
+            --fail-with-body \
+            -v
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build.log
+            test.log
+            errors.json
+            warnings.json
+          retention-days: 7
