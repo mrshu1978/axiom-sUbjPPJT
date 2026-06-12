@@ -1,0 +1,8 @@
+bin/
+obj/
+node_modules/
+dist/
+.env
+.DS_Store
+# Axiom coordination (V6.0)
+.axiom/
